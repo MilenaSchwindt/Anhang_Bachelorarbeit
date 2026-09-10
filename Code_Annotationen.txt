@@ -1,0 +1,251 @@
+import math
+import numpy as np
+import pandas as pd
+import scipy.stats as stats
+import spacy
+from statsmodels.stats.multitest import multipletests
+
+# 1. NLP-Modell laden
+nlp = spacy.load("de_core_news_lg")
+
+SEQUENZMARKER_WHITELIST = {
+    "zuerst",
+    "dann",
+    "danach",
+    "anschließend",
+    "schließlich",
+    "zuletzt",
+    "sofort",
+    "zunächst",
+    "sodann",
+    "daraufhin",
+}
+
+
+# 2. Analyse-Funktion pro Rezept
+def analyze_recipe_text(text: str, recipe_id: str, corpus_label: str) -> dict:
+    doc = nlp(text)
+
+    # Titelzeile vom eigentlichen Zubereitungstext trennen (erste Zeile = Titel)
+    lines = text.strip().split("\n")
+    if len(lines) > 1:
+        prep_text = " ".join(lines[1:])
+    else:
+        prep_text = text
+
+    prep_doc = nlp(prep_text)
+    sentences = list(prep_doc.sents)
+    total_num_sentences = len(sentences)
+
+    if total_num_sentences == 0:
+        return None
+
+    total_words_no_punct = 0
+    sents_with_infinitive = 0
+    sents_with_imperative = 0
+    sents_with_passive = 0
+    sents_with_subclause = 0
+
+    for sent in sentences:
+        words_in_sent = [token for token in sent if not token.is_punct]
+        total_words_no_punct += len(words_in_sent)
+
+        # H1: Infinitiv-Indikator
+        has_infinitive = any(
+            token.pos_ == "VERB"
+            and (
+                token.morph.get("VerbForm") == ["Inf"]
+                or token.morph.get("VerbForm") == ["Part"]
+            )
+            for token in sent
+        )
+        if has_infinitive:
+            sents_with_infinitive += 1
+
+        # H5: Imperativ-Indikator
+        has_imperative = any(
+            token.morph.get("Mood") == ["Imp"] for token in sent
+        )
+        if has_imperative:
+            sents_with_imperative += 1
+
+        # H5: Vorgangspassiv (werden + Partizip II über Satzklammer/Dependency)
+        has_procedural_passive = False
+        for token in sent:
+            if token.lemma_ == "werden" and token.pos_ in ["AUX", "VERB"]:
+                child_deps = [child.dep_ for child in token.children]
+                has_participle = any(
+                    child.morph.get("VerbForm") == ["Part"]
+                    for child in token.children
+                )
+                if (
+                    any(dep in ["aux:pass", "oc", "svp"] for dep in child_deps)
+                    or has_participle
+                ):
+                    has_procedural_passive = True
+                    break
+        if has_procedural_passive:
+            sents_with_passive += 1
+
+        # H2: Nebensatzdichte
+        has_subclause = any(
+            token.pos_ == "SCONJ"
+            or token.dep_ in ["rc", "ccomp", "advcl", "mark"]
+            for token in sent
+        )
+        if has_subclause:
+            sents_with_subclause += 1
+
+    # Lexikalische Auswertung
+    all_words = [token for token in prep_doc if not token.is_punct]
+    doc_word_count = len(all_words)
+
+    if doc_word_count == 0:
+        return None
+
+    sequence_markers_count = sum(
+        1
+        for token in all_words
+        if token.lemma_.lower() in SEQUENZMARKER_WHITELIST
+    )
+    lemmas_list = [token.lemma_.lower() for token in all_words]
+    type_token_ratio = len(set(lemmas_list)) / doc_word_count
+    nouns_count = sum(
+        1 for token in all_words if token.pos_ in ["NOUN", "PROPN"]
+    )
+    noun_ratio = nouns_count / doc_word_count
+
+    return {
+        "recipe_id": recipe_id,
+        "corpus": corpus_label,
+        "num_sentences": total_num_sentences,
+        "total_tokens": doc_word_count,
+        "avg_sentence_length": total_words_no_punct / total_num_sentences,  # H3
+        "inf_rate": sents_with_infinitive / total_num_sentences,  # H1
+        "imp_rate": sents_with_imperative / total_num_sentences,  # H5
+        "passive_rate": sents_with_passive / total_num_sentences,  # H5
+        "subclause_rate": sents_with_subclause / total_num_sentences,  # H2
+        "seq_marker_rate": sequence_markers_count / doc_word_count,  # H4
+        "ttr": type_token_ratio,
+        "noun_ratio": noun_ratio,
+    }
+
+
+# Hedges' g
+def calculate_hedges_g(group_ki: list, group_human: list) -> float:
+    n1, n2 = len(group_ki), len(group_human)
+    s1, s2 = np.std(group_ki, ddof=1), np.std(group_human, ddof=1)
+    s_pooled = math.sqrt(
+        ((n1 - 1) * s1**2 + (n2 - 1) * s2**2) / (n1 + n2 - 2)
+    )
+    if s_pooled == 0:
+        return 0.0
+    d = (np.mean(group_ki) - np.mean(group_human)) / s_pooled
+    return d * (1 - (3 / (4 * (n1 + n2) - 9)))
+
+
+# 3. Durchlauf über alle 200 Rezepte
+print("Starte spaCy-Annotation für das Gesamtkorpus (N = 200)...")
+results = []
+
+for idx, text in enumerate(human_texts):
+    res = analyze_recipe_text(text, f"HUMAN_{idx+1:03d}", "Human")
+    if res:
+        results.append(res)
+
+for idx, text in enumerate(ki_texts):
+    res = analyze_recipe_text(text, f"KI_{idx+1:03d}", "KI")
+    if res:
+        results.append(res)
+
+df_results = pd.DataFrame(results)
+
+df_human = df_results[df_results["corpus"] == "Human"]
+df_ki = df_results[df_results["corpus"] == "KI"]
+
+# OUTPUT 1: DESKRIPTIVE STATISTIK
+print("\n" + "=" * 75)
+print("1. EMPIRISCHE DESKRIPTIVSTATISTIK (GESAMTKORPUS N = 200)")
+print("=" * 75)
+metrics = [
+    ("avg_sentence_length", "Satzlänge (Token) [H3]"),
+    ("inf_rate", "Infinitivrate [H1]"),
+    ("imp_rate", "Imperativrate [H5]"),
+    ("passive_rate", "Passivrate [H5]"),
+    ("subclause_rate", "Nebensatzdichte [H2]"),
+    ("seq_marker_rate", "Sequenzmarkerdichte [H4]"),
+    ("ttr", "Type-Token-Ratio (TTR)"),
+    ("noun_ratio", "Nominalstil-Quote"),
+]
+
+for key, label in metrics:
+    m_hum = df_human[key].mean()
+    m_ki = df_ki[key].mean()
+    print(f"{label:<30} | Human: {m_hum:.4f} | KI (GPT-4): {m_ki:.4f}")
+
+# OUTPUT 2: INFERENZSTATISTIK
+print("\n" + "=" * 75)
+print("2. INFERENZSTATISTIK (WELCH-T-TESTS & HOLM-BONFERRONI-KORREKTUR)")
+print("=" * 75)
+
+p_values_raw = []
+hypothesis_labels = []
+
+# H3
+t_h3, p_h3 = stats.ttest_ind(
+    df_ki["avg_sentence_length"],
+    df_human["avg_sentence_length"],
+    equal_var=False,
+)
+g_h3 = calculate_hedges_g(
+    df_ki["avg_sentence_length"], df_human["avg_sentence_length"]
+)
+p_values_raw.append(p_h3)
+hypothesis_labels.append("H3 (Satzlänge)")
+
+# H2
+t_h2, p_h2 = stats.ttest_ind(
+    df_ki["subclause_rate"], df_human["subclause_rate"], equal_var=False
+)
+g_h2 = calculate_hedges_g(
+    df_ki["subclause_rate"], df_human["subclause_rate"]
+)
+p_values_raw.append(p_h2)
+hypothesis_labels.append("H2 (Nebensatzdichte)")
+
+# H1
+t_h1, p_h1 = stats.ttest_ind(
+    df_ki["inf_rate"], df_human["inf_rate"], equal_var=False
+)
+p_values_raw.append(p_h1)
+hypothesis_labels.append("H1 (Infinitivrate)")
+
+# H4
+t_h4, p_h4 = stats.ttest_ind(
+    df_ki["seq_marker_rate"], df_human["seq_marker_rate"], equal_var=False
+)
+p_values_raw.append(p_h4)
+hypothesis_labels.append("H4 (Sequenzmarker)")
+
+# H5
+t_h5, p_h5 = stats.ttest_ind(
+    df_ki["passive_rate"], df_human["passive_rate"], equal_var=False
+)
+p_values_raw.append(p_h5)
+hypothesis_labels.append("H5 (Passivrate)")
+
+reject_list, p_adjusted, _, _ = multipletests(
+    p_values_raw, alpha=0.05, method="holm"
+)
+
+for label, p_raw, p_adj, is_sig in zip(
+    hypothesis_labels, p_values_raw, p_adjusted, reject_list
+):
+    sig_str = "JA (p < 0.05)" if is_sig else "NEIN (n.s.)"
+    print(
+        f"{label:<22} | p-roh: {p_raw:.4e} | p-korrigiert: {p_adj:.4e} | Signifikant: {sig_str}"
+    )
+
+print("\nEffektstärken (Hedges' g):")
+print(f" - H3 Satzlänge:       g = {g_h3:.4f}")
+print(f" - H2 Nebensatzdichte:  g = {g_h2:.4f}")

@@ -1,0 +1,24 @@
+# =============================================================================
+# VOLLSTÄNDIGES EINLESEN DER KORPORA (N = 200 REZEPTE)
+# =============================================================================
+
+
+def load_recipes_from_file(filepath):
+    with open(filepath, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # Trennung der Rezepte an Doppel-Umbrüchen (Leerzeilen)
+    raw_recipes = content.split("\n\n")
+
+    # Bereinigung: Entferne leere Einträge und reine Leerzeichen
+    clean_recipes = [r.strip() for r in raw_recipes if r.strip()]
+    return clean_recipes
+
+
+# Dateien einlesen
+human_texts = load_recipes_from_file("Korpus_Rezepte_EAT SMARTER.txt")
+ki_texts = load_recipes_from_file("Korpus_Rezepte_ChatGPT.txt")
+
+print(
+    f"Erfolgreich geladen: {len(human_texts)} Human-Rezepte und {len(ki_texts)} KI-Rezepte!"
+)
